@@ -74,19 +74,32 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Building $TAG"
 
-      # ── Clone the authoritative source from Forgejo at the tag ───────────
-      # Authenticated clone: Cloudflare's Bot Fight Mode on the myoro.com.br
-      # zone flags GitHub's cloud runners as bots on anonymous HTTPS. Using
-      # the Forgejo token (read:repository scope is sufficient) routes past
-      # the bot filter cleanly.
-      - name: Clone Forgejo source
+      # ── Download the authoritative source from Forgejo at the tag ───────
+      # Cloudflare's Bot Fight Mode on the myoro.com.br zone blocks
+      # git-http/2 transports on GitHub's shared runner IP ranges with a
+      # 403, regardless of auth (the check is transport-level, not
+      # Forgejo's). The archive endpoint returns a plain .zip stream that
+      # passes BFM as long as we send a normal browser User-Agent.
+      - name: Download Forgejo source tarball
         shell: bash
         run: |
           set -euo pipefail
-          : "${FORGEJO_RELEASE_TOKEN:?FORGEJO_RELEASE_TOKEN must be set as a GitHub Actions secret}"
-          git clone --depth=1 --branch "${{ steps.meta.outputs.tag }}" \
-            "https://x-access-token:${FORGEJO_RELEASE_TOKEN}@git.myoro.com.br/$FORGEJO_REPO.git" source
-          ls source
+          TAG="${{ steps.meta.outputs.tag }}"
+          ARCHIVE="https://git.myoro.com.br/api/v1/repos/$FORGEJO_REPO/archive/$TAG.zip"
+          UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
+          mkdir -p source
+          # Retry on transient 5xx; curl -f on 4xx so we fail loudly.
+          curl -fL --retry 3 --retry-delay 5 \
+            --user-agent "$UA" \
+            -H "Authorization: token $FORGEJO_RELEASE_TOKEN" \
+            -o /tmp/source.zip "$ARCHIVE"
+          unzip -q /tmp/source.zip -d /tmp/source-extract
+          # Forgejo wraps the archive in a single top-level dir; move its
+          # contents up to `source/`.
+          inner=$(ls -d /tmp/source-extract/*/ | head -1)
+          mv "$inner"* "$inner".[!.]* source/ 2>/dev/null || true
+          rm -rf /tmp/source-extract /tmp/source.zip
+          ls source | head
 
       # ── Toolchains ───────────────────────────────────────────────────────
       - name: Install Rust
