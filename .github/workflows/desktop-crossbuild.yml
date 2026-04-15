@@ -133,38 +133,27 @@ jobs:
         working-directory: source/ui
         run: bun run build
 
-      # Tauri's MSI bundler (WiX) only accepts x.y.z[.build] with numeric
-      # parts — it rejects semver pre-release tags like `-alpha.4`. On the
-      # Windows leg we transform `0.1.0-alpha.4` → `0.1.0.4` in-place before
-      # building. Mac/Linux untouched.
-      - name: Normalise version for Windows MSI
-        if: ${{ matrix.os == 'windows-latest' }}
-        shell: bash
-        working-directory: source/crates/mfgc-desktop
-        run: |
-          set -euo pipefail
-          original=$(jq -r '.version' tauri.conf.json)
-          # Convert e.g. 0.1.0-alpha.4 -> 0.1.0.4; strip other pre-release
-          # suffixes down to their trailing numeric if any, otherwise 0.
-          case "$original" in
-            *-alpha.*|*-beta.*|*-rc.*|*-dev.*)
-              base="${original%%-*}"
-              suffix="${original##*-}"
-              num="${suffix##*.}"
-              [[ "$num" =~ ^[0-9]+$ ]] || num=0
-              windows_ver="${base}.${num}"
-              ;;
-            *)
-              windows_ver="$original"
-              ;;
-          esac
-          echo "MSI version: $original → $windows_ver"
-          jq --arg v "$windows_ver" '.version = $v' tauri.conf.json > tauri.conf.json.tmp
-          mv tauri.conf.json.tmp tauri.conf.json
-
+      # Tauri's MSI bundler (WiX) only accepts numeric pre-release parts —
+      # a semver `-alpha.4` is rejected. Tauri's config validator, on the
+      # other hand, requires a valid semver string. We resolve the
+      # contradiction by leaving the config file untouched and passing a
+      # version override through the CLI on the Windows leg only. The
+      # override drops the pre-release suffix (`0.1.0-alpha.4` →
+      # `0.1.0`) for MSI purposes; the DMGs on Mac and AppImage/.deb on
+      # Linux keep the full semver in their filenames.
       - name: Build desktop (Tauri)
         working-directory: source/crates/mfgc-desktop
-        run: cargo tauri build --target ${{ matrix.target }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            version=$(jq -r '.version' tauri.conf.json | sed -E 's/-.*$//')
+            echo "MSI version override: ${version}"
+            cargo tauri build --target ${{ matrix.target }} \
+              --config "{\"version\":\"${version}\"}"
+          else
+            cargo tauri build --target ${{ matrix.target }}
+          fi
 
       # ── Collect artifacts ────────────────────────────────────────────────
       - name: Collect artifacts
