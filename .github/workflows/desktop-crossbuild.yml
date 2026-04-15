@@ -75,11 +75,17 @@ jobs:
           echo "Building $TAG"
 
       # ── Clone the authoritative source from Forgejo at the tag ───────────
+      # Authenticated clone: Cloudflare's Bot Fight Mode on the myoro.com.br
+      # zone flags GitHub's cloud runners as bots on anonymous HTTPS. Using
+      # the Forgejo token (read:repository scope is sufficient) routes past
+      # the bot filter cleanly.
       - name: Clone Forgejo source
         shell: bash
         run: |
+          set -euo pipefail
+          : "${FORGEJO_RELEASE_TOKEN:?FORGEJO_RELEASE_TOKEN must be set as a GitHub Actions secret}"
           git clone --depth=1 --branch "${{ steps.meta.outputs.tag }}" \
-            "$FORGEJO_URL/$FORGEJO_REPO.git" source
+            "https://x-access-token:${FORGEJO_RELEASE_TOKEN}@git.myoro.com.br/$FORGEJO_REPO.git" source
           ls source
 
       # ── Toolchains ───────────────────────────────────────────────────────
