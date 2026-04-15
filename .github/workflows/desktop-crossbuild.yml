@@ -1,0 +1,207 @@
+name: Desktop cross-build
+
+# -----------------------------------------------------------------------------
+# THIS REPOSITORY IS A CI PROXY, NOT A SOURCE MIRROR.
+#
+# The authoritative source code lives at
+#   https://git.myoro.com.br/flqn/myoro_fgc_docs
+# This GitHub repository contains only `.github/workflows/` and a README
+# pointing at Forgejo. It exists solely to borrow GitHub's free macOS and
+# Windows runner minutes — minutes Forgejo's self-hosted runner cannot
+# provide because the runner is a Linux-only Docker container.
+#
+# This workflow:
+#   1. Clones the authoritative repository from Forgejo at the specified
+#      tag (source code never lives in this GitHub repo at rest).
+#   2. Builds the Tauri desktop bundles for macOS arm64, macOS x86_64,
+#      and Windows x86_64.
+#   3. Uploads them to the matching Forgejo Release via REST API.
+#
+# Triggering: `repository_dispatch` (event type: `build-release`) or
+# `workflow_dispatch`. Forgejo's `release.yml` calls the dispatch API
+# after publishing a Forgejo Release, so the cross-build is fully
+# automated — no human action required.
+# -----------------------------------------------------------------------------
+
+on:
+  repository_dispatch:
+    types: [build-release]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (e.g. v0.1.0-alpha.5)"
+        required: true
+
+concurrency:
+  group: crossbuild-${{ github.event.client_payload.tag || github.event.inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            label: macos-arm64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            label: macos-x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            label: windows-x86_64
+
+    runs-on: ${{ matrix.os }}
+    env:
+      FORGEJO_RELEASE_TOKEN: ${{ secrets.FORGEJO_RELEASE_TOKEN }}
+      FORGEJO_URL: https://git.myoro.com.br
+      FORGEJO_REPO: flqn/myoro_fgc_docs
+
+    steps:
+      # ── Resolve the tag from either trigger ──────────────────────────────
+      - name: Resolve tag
+        id: meta
+        shell: bash
+        run: |
+          TAG="${{ github.event.client_payload.tag || github.event.inputs.tag }}"
+          if [ -z "$TAG" ]; then
+            echo "::error::No tag provided (neither client_payload.tag nor inputs.tag)"
+            exit 1
+          fi
+          VERSION="${TAG#v}"
+          echo "tag=$TAG"         >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Building $TAG"
+
+      # ── Clone the authoritative source from Forgejo at the tag ───────────
+      - name: Clone Forgejo source
+        shell: bash
+        run: |
+          git clone --depth=1 --branch "${{ steps.meta.outputs.tag }}" \
+            "$FORGEJO_URL/$FORGEJO_REPO.git" source
+          ls source
+
+      # ── Toolchains ───────────────────────────────────────────────────────
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}, wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        run: cargo install wasm-pack --locked --version "^0.14"
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install cargo-tauri
+        run: cargo install tauri-cli --version "^2.0" --locked
+
+      # ── Build ────────────────────────────────────────────────────────────
+      - name: Build WASM
+        shell: bash
+        working-directory: source
+        run: wasm-pack build crates/myoroscript-wasm --target web --out-dir ../../ui/wasm-pkg
+
+      - name: Install UI deps
+        working-directory: source/ui
+        run: bun install --frozen-lockfile
+
+      - name: Build UI
+        working-directory: source/ui
+        run: bun run build
+
+      - name: Build desktop (Tauri)
+        working-directory: source/crates/mfgc-desktop
+        run: cargo tauri build --target ${{ matrix.target }}
+
+      # ── Collect artifacts ────────────────────────────────────────────────
+      - name: Collect artifacts
+        shell: bash
+        working-directory: source
+        run: |
+          mkdir -p ../dist-artifacts
+          BUNDLE="target/${{ matrix.target }}/release/bundle"
+          case "${{ matrix.os }}" in
+            macos*)
+              find "$BUNDLE/dmg" -name "*.dmg" -exec cp {} ../dist-artifacts/ \; || true
+              ;;
+            windows*)
+              find "$BUNDLE" -name "*.msi" -exec cp {} ../dist-artifacts/ \; || true
+              find "$BUNDLE" -name "*.exe" -exec cp {} ../dist-artifacts/ \; || true
+              ;;
+          esac
+          ls -la ../dist-artifacts/
+          if [ -z "$(ls -A ../dist-artifacts 2>/dev/null)" ]; then
+            echo "::error::No artifacts produced for ${{ matrix.label }}"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ matrix.label }}
+          path: dist-artifacts/
+
+      # ── Upload to the matching Forgejo Release ───────────────────────────
+      - name: Upload to Forgejo release
+        if: ${{ env.FORGEJO_RELEASE_TOKEN != '' }}
+        shell: bash
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # Retry release lookup — occasional TLS/Cloudflare blips.
+          REL_ID=""
+          for i in 1 2 3 4 5; do
+            if REL_ID=$(curl --fail-with-body --retry 3 --retry-delay 5 \
+                --connect-timeout 10 --max-time 30 \
+                -sS -H "Authorization: token $FORGEJO_RELEASE_TOKEN" \
+                "$FORGEJO_URL/api/v1/repos/$FORGEJO_REPO/releases/tags/$TAG" \
+                | jq -r '.id // empty'); then
+              [ -n "$REL_ID" ] && break
+            fi
+            echo "attempt $i: release lookup empty, retrying in ${i}s..." >&2
+            sleep "$i"
+          done
+          if [ -z "$REL_ID" ]; then
+            echo "::warning::Release $TAG not found on Forgejo after retries; skipping upload."
+            exit 0
+          fi
+          echo "Target release id: $REL_ID"
+
+          # Fetch existing assets for idempotent overwrite.
+          existing=$(curl -sf -H "Authorization: token $FORGEJO_RELEASE_TOKEN" \
+            "$FORGEJO_URL/api/v1/repos/$FORGEJO_REPO/releases/$REL_ID/assets" || echo '[]')
+
+          for f in dist-artifacts/*; do
+            [ -f "$f" ] || continue
+            name=$(basename "$f")
+            # Delete existing same-named asset so upload is idempotent.
+            aid=$(echo "$existing" | jq -r --arg n "$name" '.[] | select(.name == $n) | .id' | head -1)
+            if [ -n "$aid" ] && [ "$aid" != "null" ]; then
+              curl -sf -X DELETE \
+                -H "Authorization: token $FORGEJO_RELEASE_TOKEN" \
+                "$FORGEJO_URL/api/v1/repos/$FORGEJO_REPO/releases/$REL_ID/assets/$aid" || true
+            fi
+            echo "→ uploading $name ($(wc -c < "$f") bytes) to release $REL_ID"
+            for i in 1 2 3; do
+              if curl --fail-with-body --retry 3 --retry-delay 5 \
+                  --connect-timeout 10 --max-time 900 \
+                  -sS -X POST \
+                  -H "Authorization: token $FORGEJO_RELEASE_TOKEN" \
+                  -H "Content-Type: application/octet-stream" \
+                  "$FORGEJO_URL/api/v1/repos/$FORGEJO_REPO/releases/$REL_ID/assets?name=$name" \
+                  --data-binary "@$f"; then
+                echo "  ✓ uploaded"
+                break
+              fi
+              if [ "$i" = 3 ]; then
+                echo "::error::Upload of $name failed after 3 attempts"
+                exit 1
+              fi
+              echo "  … retry $((i+1))/3 in 10s"
+              sleep 10
+            done
+          done
